@@ -1,0 +1,27 @@
+{
+    "name": "shkeeper/gateway",
+    "type": "magento2-module",
+    "description": "description",
+    "minimum-stability": "stable",
+    "version": "1.0.0",
+    "authors": [
+        {
+            "name": "vsys-host",
+            "email": "support@shkeeper.io"
+        }
+    ],
+    "require": {
+        "magento/module-sales": "*",
+        "magento/module-payment": "*",
+        "magento/module-checkout": "*",
+        "ext-curl": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Shkeeper\\Gateway\\": ""
+        },
+        "files": [
+            "registration.php"
+        ]
+    }
+}
