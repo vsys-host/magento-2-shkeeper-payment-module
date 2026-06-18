@@ -50,12 +50,12 @@ define(
                     url: url.build('shkeeper'),
                     type: 'POST',
                     success: function (response) {
-                        let html = '<option>Select a Currency</option>';
+                        let $currencies = $('#currencies').empty();
+                        $currencies.append($('<option>').text('Select a Currency'));
                         Object.entries(response.crypto_list).forEach(data => {
                             let value = data[1];
-                            html += '<option value="' + value.name + '">' + value.display_name + '</option>';
+                            $currencies.append($('<option>').val(value.name).text(value.display_name));
                         });
-                        $('#currencies').html(html);
                     }
                 });
 
@@ -77,8 +77,9 @@ define(
                         },
                         success: function (response) {
 
-                            $('#sh-address').append('<span id="address-info">' + response.wallet + '</span>');
-                            $('#sh-amount').append('<span id="amount-info">' + response.amount + ' ' + response.display_name + '</span>');
+                            $('#sh-address').append($('<span>', { id: 'address-info' }).text(response.wallet));
+                            $('#sh-amount').append($('<span>', { id: 'amount-info' })
+                                .text(response.amount + ' ' + response.display_name));
 
                             new QRCode(document.getElementById("shkeeper-qrcode"), {
                                 text: response.wallet + '?amount=' + response.amount,

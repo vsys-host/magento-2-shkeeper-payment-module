@@ -43,7 +43,11 @@ class Index implements HttpPostActionInterface
         $quoteId = $quote->getId();
         $currency = $quote->getBaseCurrencyCode();
         $amount = $quote->getBaseGrandTotal();
-        $cryptoCurrency = $this->_request->getParam("crypto");
+        $cryptoCurrency = (string) $this->_request->getParam("crypto");
+
+        if (!preg_match('/^[A-Za-z0-9._-]{1,32}$/', $cryptoCurrency)) {
+            throw new \Magento\Framework\Exception\LocalizedException(__('Unsupported cryptocurrency.'));
+        }
 
         // Send post request to generate invoice
         $request = $this->_shkeeperHelper->getInvoiceAddress(

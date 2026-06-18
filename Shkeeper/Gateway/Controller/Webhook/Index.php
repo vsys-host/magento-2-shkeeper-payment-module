@@ -7,11 +7,14 @@ use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\App\Request\InvalidRequestException;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\App\RequestInterface;
+use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment\Transaction;
 use Magento\Sales\Model\Order\Payment\Transaction\BuilderInterface;
+use Magento\Sales\Model\Order\Invoice;
 use Magento\Sales\Model\OrderFactory;
 use Magento\Quote\Model\QuoteFactory;
 use Magento\Sales\Api\OrderRepositoryInterface;
+use Magento\Framework\DB\Transaction as DbTransaction;
 use Psr\Log\LoggerInterface;
 use Shkeeper\Gateway\Model\ShkeeperHelper;
 
@@ -25,6 +28,7 @@ class Index implements HttpPostActionInterface, CsrfAwareActionInterface
     protected $_quoteFactory;
     protected $_shkeeperHelper;
     protected $_transactionBuilder;
+    protected $_dbTransaction;
 
     public function __construct(
         RequestInterface $request,
@@ -35,6 +39,7 @@ class Index implements HttpPostActionInterface, CsrfAwareActionInterface
         QuoteFactory $quoteFactory,
         ShkeeperHelper $shkeeperHelper,
         BuilderInterface $transactionBuilder,
+        DbTransaction $dbTransaction,
     ) {
         $this->_request = $request;
         $this->_jsonFactory = $jsonFactory;
@@ -44,6 +49,7 @@ class Index implements HttpPostActionInterface, CsrfAwareActionInterface
         $this->_quoteFactory = $quoteFactory;
         $this->_shkeeperHelper = $shkeeperHelper;
         $this->_transactionBuilder = $transactionBuilder;
+        $this->_dbTransaction = $dbTransaction;
     }
 
     /**
@@ -51,7 +57,6 @@ class Index implements HttpPostActionInterface, CsrfAwareActionInterface
      */
     public function execute()
     {
-
         $result = $this->_jsonFactory->create();
 
         // collect payload
@@ -59,75 +64,60 @@ class Index implements HttpPostActionInterface, CsrfAwareActionInterface
             $shkeeperAPIKey = $this->_request->getHeader('X-Shkeeper-Api-Key');
             $postData = $this->_request->getContent();
         } catch (\Exception $exception) {
-            $this->_logger->error('Error processing webhook request: ' . $exception->getMessage());
+            $this->_logger->error('Error reading Shkeeper webhook request: ' . $exception->getMessage());
+            return $this->reject($result, 400, 'Bad Request.');
         }
 
-        // validate APIKey
+        // validate APIKey is present
         if (!$shkeeperAPIKey) {
-
-            $result->setData(['message' => 'Shkeeper API Key is required.']);
-            $this->_logger->debug('Shkeeper API Key is required.');
-            $result->setHttpResponseCode(403);
-
-            return $result;
+            $this->_logger->warning('Shkeeper webhook rejected: API key missing.');
+            return $this->reject($result, 403, 'Shkeeper API Key is required.');
         }
 
-        // validate APIKey is identical with store APIKey
-        if ($shkeeperAPIKey != $this->_shkeeperHelper->getApiKey()) {
-
-            $result->setData(['message' => 'Wrong Shkeeper API Key.']);
-            $this->_logger->debug('Wrong Shkeeper API Key.', ['callback' => $shkeeperAPIKey, 'configured' => $this->_shkeeperHelper->getApiKey()]);
-            $result->setHttpResponseCode(403);
-
-            return $result;
+        // validate APIKey matches the configured key (constant-time)
+        if (!hash_equals((string) $this->_shkeeperHelper->getApiKey(), (string) $shkeeperAPIKey)) {
+            $this->_logger->warning('Shkeeper webhook rejected: API key mismatch.', [
+                'supplied_fp' => substr(hash('sha256', (string) $shkeeperAPIKey), 0, 8),
+                'remote_ip'   => $this->_request->getClientIp(),
+            ]);
+            return $this->reject($result, 403, 'Wrong Shkeeper API Key.');
         }
 
         // validate request payload
-        if (! json_validate($postData)) {
-            $result->setData(['message' => 'Payload is invalid.']);
-            $this->_logger->debug('Payload is invalid.');
-            $result->setHttpResponseCode(400);
-            return $result;
+        if (!json_validate((string) $postData)) {
+            $this->_logger->warning('Shkeeper webhook rejected: invalid JSON payload.');
+            return $this->reject($result, 400, 'Payload is invalid.');
+        }
+
+        $payload = json_decode((string) $postData, true);
+        if (!is_array($payload) || empty($payload['external_id'])) {
+            $this->_logger->warning('Shkeeper webhook rejected: missing external_id.');
+            return $this->reject($result, 400, 'Payload is invalid.');
         }
 
         // collect order object
         try {
-
-            $payload = json_decode($postData, true);
             $order = $this->getOrderByQuoteId($payload['external_id']);
-
         } catch (\Exception $exception) {
-            $this->_logger->error('Error processing webhook request: ' . $exception->getMessage());
+            $this->_logger->error('Error loading Shkeeper webhook order: ' . $exception->getMessage());
+            return $this->reject($result, 404, 'Invalid Reference Order.');
         }
 
-        if (!$order->getId()) {
-            $result->setData(['message' => 'Invalid Reference Order.']);
-            $this->_logger->debug('Invalid Reference Order. ', $payload);
-            $result->setHttpResponseCode(404);
-            return $result;
+        if (!$order || !$order->getId()) {
+            $this->_logger->warning('Shkeeper webhook rejected: order not found.', [
+                'external_id' => $payload['external_id'],
+            ]);
+            return $this->reject($result, 404, 'Invalid Reference Order.');
         }
 
-        // calculate paid amount
-        $amount = $this->getTotalPaidAmount($payload);
-
-        // update order total paid
-        $order->setTotalInvoiced($amount);
-        $order->setTotalPaid($amount);
-        $order->setBaseTotalInvoiced($amount);
-
-        // change payment state when all amount paid
-        if ( $payload['paid']) {
-            $order->setState(\Magento\Sales\Model\Order::STATE_PROCESSING);
-            $order->setStatus(\Magento\Sales\Model\Order::STATE_PROCESSING);
-        }
-
-        // Generate comment
+        // Generate comment + register the triggering transactions
         $comment = '';
-
-        foreach ($payload['transactions'] as $transaction) {
-            if ($transaction['trigger']) {
+        foreach ($payload['transactions'] ?? [] as $transaction) {
+            if (!empty($transaction['trigger'])) {
                 // Add payment comment
-                $comment .= 'TransactionId: ' . $transaction['txid'] . ', Amount: ' . $transaction['amount_crypto'] . ' ' . $transaction['crypto'] . PHP_EOL;
+                $comment .= 'TransactionId: ' . ($transaction['txid'] ?? '')
+                    . ', Amount: ' . ($transaction['amount_crypto'] ?? '')
+                    . ' ' . ($transaction['crypto'] ?? '') . PHP_EOL;
 
                 // Add payment transaction
                 $this->addPaymentTransaction($order, $transaction);
@@ -135,20 +125,71 @@ class Index implements HttpPostActionInterface, CsrfAwareActionInterface
         }
 
         // Add the comment to the order
-        $order->addStatusHistoryComment($comment)
-            ->setIsVisibleOnFront(true) // Visible to customer
-            ->setIsCustomerNotified(true); // send an email
+        if ($comment !== '') {
+            $order->addStatusHistoryComment($comment)
+                ->setIsVisibleOnFront(true) // Visible to customer
+                ->setIsCustomerNotified(true); // send an email
+        }
 
         try {
-            $order->save();
+            // When the callback reports the invoice as fully paid, create a real Magento
+            // invoice. This marks the order paid, populates the Invoices grid, enables
+            // credit memos and lets Magento drive the state transition. canInvoice() makes
+            // a repeated/duplicate webhook idempotent (it won't invoice twice).
+            $invoice = null;
+            if (!empty($payload['paid']) && $order->canInvoice()) {
+                $invoice = $order->prepareInvoice();
+                $invoice->setRequestedCaptureCase(Invoice::CAPTURE_OFFLINE);
+                $invoice->register();
+
+                
+                $processingStatus = $order->getConfig()->getStateDefaultStatus(Order::STATE_PROCESSING);
+                $order->setState(Order::STATE_PROCESSING)
+                    ->setStatus($processingStatus ?: Order::STATE_PROCESSING);
+            }
+
+            // Note overpayments on every fully-paid callback (including later ones that
+            // arrive after the order is already invoiced), so a surplus that keeps
+            // growing is reflected. addOverpaymentComment() is self-deduplicating.
+            if (!empty($payload['paid'])) {
+                $this->addOverpaymentComment($order, $payload);
+            }
+
+            if ($invoice !== null) {
+                // Persist the new invoice and the order (comments included) atomically.
+                $this->_dbTransaction
+                    ->addObject($invoice)
+                    ->addObject($order)
+                    ->save();
+            } else {
+                // Partial payment, or already invoiced: just persist comments/transactions.
+                $this->_orderRepository->save($order);
+            }
         } catch (\Exception $exception) {
-            $this->_logger->error('Error processing save order updates: ' . $exception->getMessage());
+            $this->_logger->error('Error saving Shkeeper webhook order updates: ' . $exception->getMessage());
+            return $this->reject($result, 500, 'Could not update order.');
         }
 
         $result->setHttpResponseCode(202);
-        $result->setData(['message' => 'Order Updated.'], true);
+        $result->setData(['message' => 'Order Updated.']);
         $result->setHeader('Content-Type', 'application/json', true);
 
+        return $result;
+    }
+
+    /**
+     * Build an early-return JSON rejection response.
+     *
+     * @param \Magento\Framework\Controller\Result\Json $result
+     * @param int $code
+     * @param string $message
+     * @return \Magento\Framework\Controller\Result\Json
+     */
+    private function reject($result, int $code, string $message)
+    {
+        $result->setHttpResponseCode($code);
+        $result->setData(['message' => $message]);
+        $result->setHeader('Content-Type', 'application/json', true);
         return $result;
     }
 
@@ -183,15 +224,49 @@ class Index implements HttpPostActionInterface, CsrfAwareActionInterface
         return $orderFactory->loadByIncrementId($orderId);
     }
 
-    private function getTotalPaidAmount(array $payload): string
+    /**
+     * Record an overpayment note when SHKeeper reports a surplus that exceeds the
+     * configured margin. Self-deduplicating: the last surplus already noted is stored
+     * on the payment, so the same overpayment isn't reported twice, while a surplus
+     * that keeps growing across later callbacks adds a fresh, updated note.
+     *
+     * @param \Magento\Sales\Model\Order $order
+     * @param array $payload
+     * @return void
+     */
+    private function addOverpaymentComment($order, array $payload): void
     {
-        $amount = 0;
-
-        foreach ($payload['transactions'] as $transaction) {
-            $amount += $transaction['amount_fiat'];
+        // Use SHKeeper's own fee-adjusted surplus rather than recomputing from
+        // amount_fiat (which includes the gateway fee).
+        $overpaid = (float) ($payload['overpaid_fiat'] ?? 0);
+        if ($overpaid <= 0.00000001) {
+            return;
         }
 
-        return $amount;
+        // Margin: a % of the order total, to suppress trivial rounding surpluses.
+        $tolerance = (float) $order->getBaseGrandTotal()
+            * ($this->_shkeeperHelper->getOverpaymentMargin() / 100);
+        if ($overpaid <= $tolerance) {
+            return;
+        }
+
+      
+        $payment = $order->getPayment();
+        $lastNoted = (float) $payment->getAdditionalInformation('shkeeper_overpaid_noted');
+        if ($overpaid <= $lastNoted + 0.00000001) {
+            return;
+        }
+
+        $order->addStatusHistoryComment(
+            __(
+                'Overpayment received: %1 %2 above the order total. '
+                . 'No automatic credit is issued; ',
+                number_format($overpaid, 2),
+                (string) ($payload['fiat'] ?? $order->getBaseCurrencyCode())
+            )
+        )->setIsVisibleOnFront(true);
+
+        $payment->setAdditionalInformation('shkeeper_overpaid_noted', $overpaid);
     }
 
     private function addPaymentTransaction($order, $transactionData)

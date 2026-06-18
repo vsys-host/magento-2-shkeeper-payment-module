@@ -3,7 +3,7 @@ SHKeeper payment module for for Magento 2 Community Edition
 
 ## Requirements
 
-* Magento 2 Community Edition 2.x (Tested on 2.4.7)
+* Magento 2 Community Edition 2.x (Tested on 2.4.9)
 * PHP version >= 8.0.0
 
 *Note:* this module has been tested only with Magento 2 __Community Edition__, it may not work as intended with Magento 2 __Enterprise Edition__

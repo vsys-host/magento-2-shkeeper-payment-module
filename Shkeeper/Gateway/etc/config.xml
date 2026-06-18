@@ -7,8 +7,9 @@
                 <active>1</active>
                 <model>Shkeeper\Gateway\Model\Shkeeper</model>
                 <title>SHKeeper Gateway</title>
-                <instructions>Test from configurations</instructions>
-                <order_status>pendning_payment</order_status>
+                <instructions>Pay with cryptocurrency. Select a currency and send the exact amount to the displayed address to complete your order.</instructions>
+                <order_status>pending_payment</order_status>
+                <overpayment_margin>0</overpayment_margin>
                 <allowspecific>0</allowspecific>
                 <group>offline</group>
                 <sort_order>0</sort_order>

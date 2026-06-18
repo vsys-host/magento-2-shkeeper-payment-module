@@ -14,6 +14,7 @@ class ShkeeperHelper implements ConfigProviderInterface
     protected const XML_PATH_SHKEEPER_API_KEY = 'payment/shkeeper/shkeeper_api_key';
     protected const XML_PATH_SHKEEPER_API_URL = 'payment/shkeeper/shkeeper_api_url';
     protected const XML_PATH_SHKEEPER_INSTRUCTIONS = 'payment/shkeeper/instructions';
+    protected const XML_PATH_SHKEEPER_OVERPAYMENT_MARGIN = 'payment/shkeeper/overpayment_margin';
     protected const XML_PATH_SECURE_BASE_URL = 'web/secure/base_url';
     protected const SHKEEPER_CODE = 'shkeeper';
 
@@ -30,20 +31,27 @@ class ShkeeperHelper implements ConfigProviderInterface
      */
     protected Curl $_curl;
     protected LoggerInterface $_logger;
+    /**
+     * @var \Magento\Framework\Encryption\EncryptorInterface $_encryptor
+     */
+    protected \Magento\Framework\Encryption\EncryptorInterface $_encryptor;
 
     /**
      * @param ScopeConfigInterface $scopeConfig
      * @param Curl $curl
      * @param LoggerInterface $logger
+     * @param \Magento\Framework\Encryption\EncryptorInterface $encryptor
      */
     public function __construct(
         ScopeConfigInterface $scopeConfig,
         Curl $curl,
         LoggerInterface $logger,
+        \Magento\Framework\Encryption\EncryptorInterface $encryptor,
     ) {
         $this->_scopeConfig = $scopeConfig;
         $this->_curl = $curl;
         $this->_logger = $logger;
+        $this->_encryptor = $encryptor;
     }
 
     public function getCode(): string
@@ -53,12 +61,31 @@ class ShkeeperHelper implements ConfigProviderInterface
 
     public function getApiKey(): string
     {
-        return $this->_scopeConfig->getValue(self::XML_PATH_SHKEEPER_API_KEY, ScopeInterface::SCOPE_STORE);
+        $value = (string) $this->_scopeConfig->getValue(self::XML_PATH_SHKEEPER_API_KEY, ScopeInterface::SCOPE_STORE);
+
+        return $value !== '' ? $this->_encryptor->decrypt($value) : '';
     }
 
     public function getApiURL(): string
     {
         return $this->_scopeConfig->getValue(self::XML_PATH_SHKEEPER_API_URL, ScopeInterface::SCOPE_STORE);
+    }
+
+    /**
+     * Overpayment tolerance, as a percentage of the order grand total. A surplus
+     * smaller than this share is treated as rate/fee rounding and not flagged.
+     * Clamped to a non-negative value; 0 means every surplus is reported.
+     *
+     * @return float
+     */
+    public function getOverpaymentMargin(): float
+    {
+        $margin = (float) $this->_scopeConfig->getValue(
+            self::XML_PATH_SHKEEPER_OVERPAYMENT_MARGIN,
+            ScopeInterface::SCOPE_STORE
+        );
+
+        return $margin > 0 ? $margin : 0.0;
     }
 
     public function getInstructions(): string
@@ -74,13 +101,11 @@ class ShkeeperHelper implements ConfigProviderInterface
 
     public function getConfig(): array
     {
+
         return [
             'payment' => [
                 $this->getCode() => [
-                    'apiKey' => $this->getApiKey(),
-                    'apiUrl' => $this->getApiURL(),
                     'instructions' => $this->getInstructions(),
-                    'callback_url'  => $this->getCallbackURL(),
                 ]
             ]
         ];
@@ -108,14 +133,8 @@ class ShkeeperHelper implements ConfigProviderInterface
 
             $url = $this->addURLSchema($this->getApiURL());
             $url = $this->addURLSeparator($url);
-            $url = $url . $cryptoCurrency . '/payment_request';
 
-            // Initialize cURL session
-            $ch = curl_init($url);
-
-            if ($ch === false) {
-                throw new \Exception('Failed to initialize cURL session.');
-            }
+            $url = $url . rawurlencode($cryptoCurrency) . '/payment_request';
 
             $this->_curl->setHeaders($headers);
             $this->_curl->post($url, $jsonParams);
